@@ -6,18 +6,128 @@ import fs from 'fs';
 import emailService from '../services/emailService.js';
 import notificationService from '../services/notificationService.js';
 
-// Crear una nueva asignación (función básica para evitar error de importación)
+// Crear una nueva asignación (inmediata) con soporte para "Asignación General" y envío de correos
 export const createAssignment = async (req, res) => {
     try {
+        // Normalizar campos provenientes de FormData
+        const rawBody = req.body || {};
+
+        const title = (rawBody.title || '').trim();
+        const description = (rawBody.description || '').trim();
+        const dueDate = rawBody.dueDate ? new Date(rawBody.dueDate) : null;
+        const closeDate = rawBody.closeDate ? new Date(rawBody.closeDate) : null;
+
+        // isGeneral puede venir como string 'true'/'false' desde FormData
+        const isGeneral = (
+            typeof rawBody.isGeneral === 'string' ? rawBody.isGeneral === 'true' : !!rawBody.isGeneral
+        );
+
+        // Validaciones básicas
+        if (!title || !description || !dueDate || !closeDate) {
+            return res.status(400).json({
+                success: false,
+                error: 'Título, descripción, fecha de entrega y fecha de cierre son requeridos'
+            });
+        }
+        if (closeDate < dueDate) {
+            return res.status(400).json({
+                success: false,
+                error: 'La fecha de cierre debe ser posterior o igual a la fecha de entrega'
+            });
+        }
+
+        // Normalizar assignedTo desde FormData (puede llegar como assignedTo o assignedTo[])
+        let assignedToInput = rawBody['assignedTo[]'] ?? rawBody.assignedTo ?? [];
+        if (typeof assignedToInput === 'string') {
+            assignedToInput = [assignedToInput];
+        }
+        if (!Array.isArray(assignedToInput)) {
+            assignedToInput = [];
+        }
+
+        // Resolver lista final de docentes a asignar
+        let assignedTeacherIds = [];
+        if (isGeneral) {
+            // Asignación general: asignar a TODOS los docentes
+            const allTeachers = await User.find({ role: 'docente' }).select('_id');
+            assignedTeacherIds = allTeachers.map(t => t._id);
+        } else {
+            assignedTeacherIds = assignedToInput;
+        }
+
+        if (!isGeneral && assignedTeacherIds.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'Debe seleccionar al menos un docente o marcar como asignación general'
+            });
+        }
+
+        // Procesar adjuntos subidos por multer
+        const files = req.files || [];
+        const attachments = files.map(file => ({
+            fileName: file.originalname,
+            fileUrl: file.path
+        }));
+
+        // Crear documento de asignación
         const assignment = new Assignment({
-            ...req.body,
+            title,
+            description,
+            dueDate,
+            closeDate,
+            isGeneral, // Guardamos el flag, aunque ya asignamos a todos si es general
+            assignedTo: assignedTeacherIds,
+            attachments,
+            status: 'pending', // Al crear inmediata, estado base pendiente
             createdBy: req.user?._id || null,
             createdAt: new Date()
         });
-        await assignment.save();
-        res.status(201).json({ success: true, assignment });
+
+        const savedAssignment = await assignment.save();
+
+        // Poblar para obtener datos de email
+        await savedAssignment.populate('assignedTo', 'nombre apellidoPaterno apellidoMaterno email');
+
+        // Enviar notificaciones por correo y web a los docentes asignados
+        if (savedAssignment.assignedTo && savedAssignment.assignedTo.length > 0) {
+            for (const teacher of savedAssignment.assignedTo) {
+                try {
+                    await emailService.sendNewAssignmentNotification({
+                        to: teacher.email,
+                        teacherName: `${teacher.nombre} ${teacher.apellidoPaterno}`,
+                        title: savedAssignment.title,
+                        description: savedAssignment.description,
+                        dueDate: savedAssignment.dueDate,
+                        closeDate: savedAssignment.closeDate,
+                        assignmentUrl: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/assignment/${savedAssignment._id}`
+                    });
+
+                    // Notificación web (si el servicio está disponible)
+                    try {
+                        await notificationService.sendNotification([teacher._id], {
+                            type: 'new_assignment',
+                            title: '📝 Nueva Asignación Disponible',
+                            message: `Se ha publicado una nueva asignación: "${savedAssignment.title}"`,
+                            assignmentId: savedAssignment._id
+                        });
+                    } catch (notifError) {
+                        // Log pero no bloquear la creación
+                        console.error('Error enviando notificación web:', notifError?.message || notifError);
+                    }
+                } catch (mailError) {
+                    // Log pero no bloquear la creación
+                    console.error('Error enviando correo de nueva asignación:', mailError?.message || mailError);
+                }
+            }
+        }
+
+        return res.status(201).json({
+            success: true,
+            assignment: savedAssignment
+        });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        console.error('Error creando asignación:', error);
+        return res.status(500).json({ success: false, error: error.message || 'Error al crear la asignación' });
     }
 };
 
