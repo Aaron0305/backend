@@ -449,29 +449,58 @@ export const getTeacherAssignmentStats = async (req, res) => {
         const now = new Date();
         
         // Obtener todas las asignaciones del docente
-        const assignments = await Assignment.find({
-            assignedTo: userId
+        const assignments = await Assignment.find({ assignedTo: userId }).populate('responses.user', '_id');
+
+        // Calcular estadísticas alineadas con Structure
+        const stats = {
+            total: 0,
+            pending: 0,
+            completed: 0,
+            completedLate: 0,
+            notDelivered: 0
+        };
+
+        assignments.forEach(assignment => {
+            stats.total += 1;
+
+            // Buscar respuesta del docente
+            const response = assignment.responses?.find(r => r.user && r.user._id?.toString() === userId.toString());
+
+            if (response) {
+                if (response.status === 'submitted') {
+                    if (response.submissionStatus === 'on-time') {
+                        stats.completed += 1;
+                    } else if (response.submissionStatus === 'late') {
+                        stats.completedLate += 1;
+                    } else if (response.submissionStatus === 'closed') {
+                        stats.notDelivered += 1;
+                    } else {
+                        // Si por alguna razón no hay submissionStatus, considerar pendiente
+                        stats.pending += 1;
+                    }
+                } else if (response.status === 'reviewed') {
+                    // Marcado por admin como no entregado
+                    stats.notDelivered += 1;
+                } else {
+                    stats.pending += 1;
+                }
+            } else {
+                // Sin respuesta: evaluar fechas
+                const dueDate = new Date(assignment.dueDate);
+                const closeDate = new Date(assignment.closeDate);
+                if (now > closeDate) {
+                    stats.notDelivered += 1;
+                } else {
+                    stats.pending += 1;
+                }
+            }
         });
 
-        // Calcular estadísticas
-        const total = assignments.length;
-        const completed = assignments.filter(a => a.status === 'completed').length;
-        
-        // Filtrar asignaciones pendientes y vencidas
-        const pendingAssignments = assignments.filter(a => a.status === 'pending');
-        const pending = pendingAssignments.filter(a => new Date(a.dueDate) > now).length;
-        const overdue = pendingAssignments.filter(a => new Date(a.dueDate) <= now).length;
-
-        console.log('Estadísticas calculadas:', { total, pending, completed, overdue }); // Para debug
+        console.log('Estadísticas docente (alineadas):', stats);
 
         res.status(200).json({
             success: true,
-            stats: {
-                total,
-                pending,
-                completed,
-                overdue
-            }
+            stats
         });
     } catch (error) {
         console.error('Error al obtener estadísticas de asignaciones:', error);
@@ -485,59 +514,30 @@ export const getTeacherAssignmentStats = async (req, res) => {
 // Obtener asignaciones filtradas para el docente
 export const getTeacherFilteredAssignments = async (req, res) => {
     try {
-        const { status, search, sort = '-createdAt', page = 1, limit = 10 } = req.query;
-        const query = { assignedTo: req.user._id };
-        const now = new Date();
+        const { status = 'all', search, sort = '-createdAt', page = 1, limit = 10 } = req.query;
+        const baseQuery = { assignedTo: req.user._id };
 
         console.log('🔍 Obteniendo asignaciones para docente:', req.user.email);
-        console.log('📋 Filtros recibidos:', { status, search, sort });
+        console.log('📋 Filtros recibidos:', { status, search, sort, page, limit });
 
-        // Aplicar filtro de estado
-        if (status && status !== 'all') {
-            if (status === 'vencido') {
-                // Para vencidas: mostrar asignaciones activas o pendientes que pasaron su fecha de vencimiento
-                query.$or = [
-                    { status: 'pending', dueDate: { $lt: now } },
-                    { status: 'active', dueDate: { $lt: now } }
-                ];
-            } else if (status === 'pending') {
-                // Para pendientes: mostrar asignaciones activas o pendientes que NO han pasado su fecha de vencimiento
-                query.$or = [
-                    { status: 'pending', dueDate: { $gt: now } },
-                    { status: 'active', dueDate: { $gt: now } }
-                ];
-            } else if (status === 'completed') {
-                // Para completadas: mostrar solo las completadas sin importar la fecha
-                query.status = 'completed';
-            }
-        } else {
-            // Si no hay filtro específico, mostrar todas las asignaciones relevantes para el docente
-            query.status = { $in: ['pending', 'active', 'completed'] };
-        }
-
-        // Aplicar búsqueda si existe
+        // Búsqueda por texto
         if (search) {
-            query.$or = [
+            baseQuery.$or = [
                 { title: { $regex: search, $options: 'i' } },
                 { description: { $regex: search, $options: 'i' } }
             ];
         }
 
-        console.log('🔎 Query construida:', JSON.stringify(query, null, 2));
-
-        const assignments = await Assignment.find(query)
+        // Traer todas las asignaciones del docente; el filtrado por estado será a nivel lógico por docente
+        const allAssignments = await Assignment.find(baseQuery)
             .populate('createdBy', 'nombre apellidoPaterno apellidoMaterno')
             .populate('responses.user', 'nombre apellidoPaterno apellidoMaterno email')
-            .sort(sort)
-            .skip((parseInt(page) - 1) * parseInt(limit))
-            .limit(parseInt(limit));
+            .sort(sort);
 
-        const total = await Assignment.countDocuments(query);
-
-        console.log(`📊 Asignaciones encontradas: ${assignments.length} de ${total} total`);
+        console.log(`📊 Total asignaciones recuperadas para el docente: ${allAssignments.length}`);
 
         // Procesar las asignaciones para incluir el estado específico del docente actual
-        const processedAssignments = assignments.map(assignment => {
+        const processedAssignmentsAll = allAssignments.map(assignment => {
             const assignmentObj = assignment.toObject();
             
             // Buscar la respuesta específica del docente actual
@@ -596,20 +596,40 @@ export const getTeacherFilteredAssignments = async (req, res) => {
                     statusOriginal: assignment.status,
                     statusParaDocente: baseStatus
                 });
+                assignmentObj.status = baseStatus;
             }
             
             return assignmentObj;
         });
 
-        console.log(`📤 Enviando ${processedAssignments.length} asignaciones al docente ${req.user.email}`);
+        // Filtrado por estado del lado del servidor usando el estado derivado del docente
+        let filtered = processedAssignmentsAll;
+        if (status && status !== 'all') {
+            if (status === 'vencido') {
+                // Compatibilidad: vencido equivale a pendientes con dueDate pasado
+                const now = new Date();
+                filtered = filtered.filter(a => a.status === 'pending' && new Date(a.dueDate) < now);
+            } else if (['pending', 'completed', 'completed-late', 'not-delivered'].includes(status)) {
+                filtered = filtered.filter(a => a.status === status);
+            }
+        }
+
+        const totalItems = filtered.length;
+        const pageNum = parseInt(page);
+        const limitNum = parseInt(limit);
+        const start = (pageNum - 1) * limitNum;
+        const end = start + limitNum;
+        const paginated = filtered.slice(start, end);
+
+        console.log(`📤 Enviando ${paginated.length} asignaciones (de ${totalItems}) al docente ${req.user.email}`);
 
         res.status(200).json({
             success: true,
-            assignments: processedAssignments,
+            assignments: paginated,
             pagination: {
-                currentPage: parseInt(page),
-                totalPages: Math.ceil(total / parseInt(limit)),
-                totalItems: total
+                currentPage: pageNum,
+                totalPages: Math.ceil(totalItems / limitNum) || 1,
+                totalItems
             }
         });
     } catch (error) {
